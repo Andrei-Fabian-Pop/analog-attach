@@ -53,7 +53,7 @@ jobs:
         run: |
           # Use git cherry to find commits not yet applied (by patch content)
           # + means needs to be applied, - means already applied
-          NEW_COMMITS=$(git cherry HEAD upstream/main | grep -c '^+' || echo 0)
+          NEW_COMMITS=$(git cherry HEAD upstream/main | grep '^+' | wc -l)
           echo "new_commits=$NEW_COMMITS" >> $GITHUB_OUTPUT
           echo "Found $NEW_COMMITS commits to sync"
 
