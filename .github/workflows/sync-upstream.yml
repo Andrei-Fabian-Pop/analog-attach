@@ -1,0 +1,146 @@
+name: Sync from Open Source Upstream
+
+on:
+  schedule:
+    # Runs every Wednesday at 8am UTC (11am Bucharest time)
+    - cron: '0 8 * * 3'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (do not push changes)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote (open source)
+        run: git remote add upstream https://github.com/analogdevicesinc/analog-attach.git
+
+      - name: Fetch upstream
+        run: git fetch upstream
+
+      - name: Create or checkout sync branch
+        run: |
+          git fetch origin sync-open-source || true
+          if git show-ref --verify --quiet refs/remotes/origin/sync-open-source; then
+            git checkout sync-open-source
+            git reset --hard origin/sync-open-source
+          else
+            git checkout -b sync-open-source
+          fi
+
+      - name: Check for new commits
+        id: check
+        run: |
+          # Read last synced commit SHA (if file exists)
+          if [ -f .github/.last-upstream-sync ]; then
+            LAST_SYNC=$(cat .github/.last-upstream-sync)
+            echo "Last synced commit: $LAST_SYNC"
+          else
+            echo "No previous sync found, will sync all commits"
+            LAST_SYNC=""
+          fi
+
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          echo "upstream_head=$UPSTREAM_HEAD" >> $GITHUB_OUTPUT
+          echo "last_sync=$LAST_SYNC" >> $GITHUB_OUTPUT
+
+          if [ "$LAST_SYNC" = "$UPSTREAM_HEAD" ]; then
+            echo "Already up to date"
+            echo "upstream_commits=0" >> $GITHUB_OUTPUT
+          else
+            if [ -n "$LAST_SYNC" ]; then
+              COMMIT_COUNT=$(git rev-list "$LAST_SYNC".."$UPSTREAM_HEAD" --count)
+            else
+              COMMIT_COUNT=$(git rev-list "$UPSTREAM_HEAD" --count)
+            fi
+            echo "Found $COMMIT_COUNT new commits to cherry-pick"
+            echo "upstream_commits=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cherry-pick upstream commits
+        if: steps.check.outputs.upstream_commits != '0'
+        run: |
+          LAST_SYNC="${{ steps.check.outputs.last_sync }}"
+          UPSTREAM_HEAD="${{ steps.check.outputs.upstream_head }}"
+
+          if [ -n "$LAST_SYNC" ]; then
+            # Get commits in chronological order (oldest first)
+            COMMITS=$(git rev-list --reverse "$LAST_SYNC".."$UPSTREAM_HEAD")
+          else
+            # First sync - cherry-pick all commits from upstream
+            COMMITS=$(git rev-list --reverse "$UPSTREAM_HEAD")
+          fi
+
+          for COMMIT in $COMMITS; do
+            echo "Cherry-picking $COMMIT"
+            git cherry-pick "$COMMIT" --allow-empty
+          done
+
+      - name: Update sync marker
+        if: steps.check.outputs.upstream_commits != '0'
+        run: |
+          echo "${{ steps.check.outputs.upstream_head }}" > .github/.last-upstream-sync
+          git add .github/.last-upstream-sync
+          git commit -m "chore: update upstream sync marker"
+
+      - name: Push changes
+        if: steps.check.outputs.upstream_commits != '0' && inputs.dry_run != true
+        run: git push origin sync-open-source --force
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Upstream sync failed on ${new Date().toISOString().split('T')[0]}`;
+            const body = `## Upstream Sync Failed
+
+            The automatic sync from [analogdevicesinc/analog-attach](https://github.com/analogdevicesinc/analog-attach) failed.
+
+            **Workflow run:** [View logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+
+            ### Possible causes:
+            - Merge conflicts between upstream and this repository
+            - Network issues fetching from upstream
+            - Permission issues pushing to this repository
+
+            ### Resolution:
+            1. Check the workflow logs for details
+            2. If there are merge conflicts, resolve them manually:
+               \`\`\`bash
+               git fetch upstream
+               git merge upstream/main
+               # Resolve conflicts
+               git push origin main
+               \`\`\`
+
+            /cc @Andreifabian-Pop_adi
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['sync-failure', 'automated']
+            });
